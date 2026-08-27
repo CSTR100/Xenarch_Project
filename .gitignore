@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Harness output
+results/
+
+# Data. Imagery is large and usually not ours to redistribute. Supply the
+# natural-geology training corpus and the labeled eval regions locally; see
+# the README and the eval_harness.py docstring for the expected layout.
+training data/
+eval/
+*.tif
+*.tiff
