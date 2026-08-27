@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Harness output
+results/
+
+# Data. Imagery is large and usually not ours to redistribute; the training
+# corpus and eval fixtures are rebuilt locally:
+#   python inject_anomalies.py --demo --seed 1234
+training data/
+eval/
+*.tif
+*.tiff

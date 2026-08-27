@@ -1,0 +1,6 @@
+{
+  "engine": "mk19",
+  "epochs": 6,
+  "batch_size": 8,
+  "max_train_chips": 150
+}

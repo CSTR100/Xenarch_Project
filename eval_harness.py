@@ -2,8 +2,8 @@
 Xenarch iterative evaluation harness.
 
 Usage:
-    # First time: build injected images
-    python inject_anomalies.py
+    # First time: build labeled fixtures (--demo needs no external imagery)
+    python inject_anomalies.py --demo
 
     # Run iteration 1 with default config
     python eval_harness.py --iteration 1
@@ -14,11 +14,11 @@ Usage:
     # List previous iterations
     python eval_harness.py --status
 
-Config JSON keys (all optional, defaults match mk17):
-    chip_size, percentile, epochs, latent_dim, batch_size, lr,
-    warmup_epochs, use_vae,
-    combined_weights:   {mse, density, contextual, gradient, edge}
-    confidence_weights: {score, contextual, mse}
+Config JSON keys (all optional; defaults come from xenarch_core):
+    chip_size, overlap, percentile, epochs, latent_dim, batch_size, lr,
+    warmup_epochs, trim_frac, max_train_chips, training_dir,
+    engine:             "mk19" (default) | "mk17" (legacy, comparison only)
+    combined_weights:   {mse, latent, contextual, gradient, edge}
 
 Stopping criteria (configurable):
     separation_threshold: float  (default 0.30)
@@ -42,6 +42,7 @@ import numpy as np
 BASE = Path(__file__).parent
 sys.path.insert(0, str(BASE))
 from xenarch_pipeline import run_pipeline, DEFAULT_CONFIG
+from xenarch_core import COMBINED_WEIGHTS, METRIC_KEYS
 
 
 # ── default harness config ─────────────────────────────────────────────────
@@ -108,7 +109,7 @@ def compute_region_metrics(results: List[Dict], ground_truth: Dict) -> Dict:
             return {k: None for k in keys}
         return {k: float(np.mean([x[k] for x in lst])) for k in keys}
 
-    metric_keys = ["mse_norm", "contextual_norm", "gradient_norm", "edge_norm", "density_norm"]
+    metric_keys = ["mse_norm", "contextual_norm", "gradient_norm", "edge_norm", "latent_norm"]
 
     t_conf = safe_mean(targets, "confidence")
     f_conf = safe_mean(fps,     "confidence")
@@ -241,7 +242,7 @@ def append_progress_log(iteration: int, split: str, agg: Dict, config: Dict) -> 
     with open(log_path, "a", newline="") as f:
         fieldnames = ["iteration", "split", "mean_separation", "min_separation",
                       "worst_region", "n_regions", "timestamp",
-                      "combined_mse", "combined_density", "combined_contextual",
+                      "combined_mse", "combined_latent", "combined_contextual",
                       "combined_gradient", "combined_edge",
                       "conf_score", "conf_contextual", "conf_mse"]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -258,7 +259,7 @@ def append_progress_log(iteration: int, split: str, agg: Dict, config: Dict) -> 
             "n_regions":         agg.get("n_regions", 0),
             "timestamp":         datetime.now().isoformat(timespec="seconds"),
             "combined_mse":        cw.get("mse", ""),
-            "combined_density":    cw.get("density", ""),
+            "combined_latent":     cw.get("latent", ""),
             "combined_contextual": cw.get("contextual", ""),
             "combined_gradient":   cw.get("gradient", ""),
             "combined_edge":       cw.get("edge", ""),
@@ -288,20 +289,20 @@ def print_report(
     config: Dict,
     threshold: float,
 ) -> None:
-    cw = config.get("combined_weights",  {})
-    kw = config.get("confidence_weights", {})
+    # Mk19 carries its weights in xenarch_core; a config may still override them.
+    cw = {**COMBINED_WEIGHTS, **config.get("combined_weights", {})}
+    engine = config.get("engine", "mk19")
     print("\n" + "═" * 72)
     print(f"  XENARCH EVAL HARNESS — Iteration {iteration}   "
           f"{datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print("═" * 72)
     print(f"\nConfig:")
-    print(f"  chip_size={config.get('chip_size',256)}  percentile={config.get('percentile',92)}"
-          f"  use_vae={config.get('use_vae',False)}")
-    print(f"  combined  : mse={cw.get('mse',0.30):.2f}  density={cw.get('density',0.20):.2f}"
-          f"  contextual={cw.get('contextual',0.30):.2f}  gradient={cw.get('gradient',0.15):.2f}"
-          f"  edge={cw.get('edge',0.05):.2f}")
-    print(f"  confidence: score={kw.get('score',0.50):.2f}  contextual={kw.get('contextual',0.30):.2f}"
-          f"  mse={kw.get('mse',0.20):.2f}")
+    print(f"  engine={engine}  chip_size={config.get('chip_size',256)}"
+          f"  overlap={config.get('overlap',0.5)}"
+          f"  percentile={config.get('percentile',92)}"
+          f"  epochs={config.get('epochs',20)}  trim_frac={config.get('trim_frac',0.08)}")
+    print(f"  combined  : " + "  ".join(
+        f"{k}={cw.get(k,0.0):.2f}" for k in METRIC_KEYS))
     print(f"  Stopping threshold: {threshold}")
 
     for split_label, split_key in [("TUNING SET", "tuning"), ("HELD-OUT SET", "held-out")]:
@@ -340,7 +341,7 @@ def print_report(
     # per-metric breakdown for diagnosis
     print(f"\n{'─' * 72}")
     print("  METRIC BREAKDOWN (normalised means per chip class)")
-    print(f"  {'Region':<20} {'Class':<8} {'mse':>6} {'ctx':>6} {'grad':>6} {'edge':>6} {'den':>6}")
+    print(f"  {'Region':<20} {'Class':<8} {'mse':>6} {'ctx':>6} {'grad':>6} {'edge':>6} {'lat':>6}")
     for rid, data in region_results.items():
         m = data["metrics"]
         for cls, md in [("target", m["target_metric_means"]),
@@ -351,7 +352,7 @@ def print_report(
             print(f"  {rid:<20} {cls:<8} "
                   f"{fmt(md.get('mse_norm')):>6} {fmt(md.get('contextual_norm')):>6} "
                   f"{fmt(md.get('gradient_norm')):>6} {fmt(md.get('edge_norm')):>6} "
-                  f"{fmt(md.get('density_norm')):>6}")
+                  f"{fmt(md.get('latent_norm')):>6}")
 
     # anomaly type summary
     print(f"\n{'─' * 72}")
@@ -431,7 +432,7 @@ def run_harness(iteration: int, config: Dict, harness_config: Dict) -> None:
         with open(region_dir / "chip_labels.csv", "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=[
                 "chip_id", "center_x", "center_y", "label", "rank", "confidence",
-                "mse_norm", "density_norm", "contextual_norm", "gradient_norm", "edge_norm",
+                "mse_norm", "latent_norm", "contextual_norm", "gradient_norm", "edge_norm",
             ])
             writer.writeheader()
             label_map = assign_labels(results, gt.get("zones", []))
@@ -444,7 +445,7 @@ def run_harness(iteration: int, config: Dict, harness_config: Dict) -> None:
                     "rank":           c["rank"],
                     "confidence":     round(c["confidence"], 4),
                     "mse_norm":       round(c.get("mse_norm", 0), 4),
-                    "density_norm":   round(c.get("density_norm", 0), 4),
+                    "latent_norm":    round(c.get("latent_norm", 0), 4),
                     "contextual_norm":round(c.get("contextual_norm", 0), 4),
                     "gradient_norm":  round(c.get("gradient_norm", 0), 4),
                     "edge_norm":      round(c.get("edge_norm", 0), 4),
@@ -519,7 +520,7 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""
             Workflow:
-              1.  python inject_anomalies.py          # one-time setup
+              1.  python inject_anomalies.py --demo   # one-time setup
               2.  python eval_harness.py --iteration 1
               3.  Examine report, adjust config JSON
               4.  python eval_harness.py --iteration 2 --config updated.json
@@ -529,7 +530,7 @@ if __name__ == "__main__":
     parser.add_argument("--iteration", type=int, default=None,
                         help="Iteration number (required unless --status)")
     parser.add_argument("--config", default=None,
-                        help="Path to config JSON (defaults to mk17 defaults)")
+                        help="Path to config JSON (defaults to Mk19 defaults)")
     parser.add_argument("--separation-threshold", type=float, default=0.30)
     parser.add_argument("--overfit-patience",     type=int,   default=2)
     parser.add_argument("--max-iterations",       type=int,   default=6)

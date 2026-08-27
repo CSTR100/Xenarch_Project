@@ -1,0 +1,18 @@
+# Xenarch runtime dependencies.
+#
+# torch and rasterio are optional but strongly recommended:
+#   without torch    the VAE is unavailable and scoring falls back to the
+#                    NumPy robust scorer (detection quality drops materially)
+#   without rasterio GeoTIFFs load via Pillow and geospatial metadata is ignored
+
+numpy>=1.24
+scipy>=1.10
+pillow>=10.0
+flask>=3.0
+flask-cors>=4.0
+loguru>=0.7
+gunicorn>=21.2
+
+# Optional — comment out for a numpy-only install
+torch>=2.0
+rasterio>=1.3

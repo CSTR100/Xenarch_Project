@@ -13,27 +13,42 @@ is the choice of what goes into the natural-geology training folder.
 
 ## Status
 
-Current production entry point is `xenarch_mk19_script.py` (Mk19), a self-contained
-Flask application with an embedded web frontend.
+Mk19 is current. The detection algorithm lives in **`xenarch_core.py`** and has exactly
+one implementation, used by both the web application and the evaluation harness.
 
 In testing over Apollo landing-site imagery, the pipeline ranked the Apollo 11 landing
 site hardware among its top anomaly detections without any prior knowledge of the site.
-Note that no evaluation artifacts from that run are committed to this repository — the
-result is recorded here from project testing, not reproducible from files currently in
-the repo. See [Evaluation](#evaluation) for the harness that produces reproducible
-numbers, and [Known gaps](#known-gaps) for what is missing.
+No artifacts from that run are committed here, so it is not reproducible from this
+repository — it is recorded as project testing, not as a benchmark. What *is*
+reproducible is the synthetic harness below.
+
+## Quick start
+
+```bash
+pip install -r requirements.txt
+
+# Build a labeled fixture set and a clean natural baseline (no external data needed)
+python inject_anomalies.py --demo
+
+# Score the detector against it
+python eval_harness.py --iteration 1 --config eval_config_demo.json
+
+# Or run the web app
+python xenarch_mk19_script.py     # → http://0.0.0.0:5000
+```
 
 ## Repository contents
 
 | File | Role |
 | --- | --- |
-| `xenarch_mk19_script.py` | Mk19 production pipeline + Flask API + embedded web UI. The current model. |
-| `xenarch_pipeline.py` | Importable, Flask-free pipeline used by the evaluation harness. Still on Mk17-era scoring — see [Known gaps](#known-gaps). |
-| `eval_harness.py` | Iterative evaluation harness: scores labeled regions, tracks tuning vs. held-out separation, applies stopping criteria. |
+| `xenarch_core.py` | **The model.** Chip extraction, VAE, trimmed training, the five metrics, normalization, confidence, fine localization. No Flask, no web concerns. |
+| `xenarch_mk19_script.py` | Web layer only: upload handling, job tracking, embedded frontend, JSON API. Calls the core. |
+| `xenarch_pipeline.py` | Harness-facing `run_pipeline()`. Calls the same core. Also holds a frozen Mk17 scorer for comparison. |
+| `eval_harness.py` | Iterative evaluation: per-region separation, tuning vs. held-out splits, stopping criteria. |
+| `inject_anomalies.py` | Builds labeled evaluation fixtures — synthetic anomalies at known coordinates. |
+| `eval_config_demo.json` | Fast config used by the reproducible run below. |
 
 ## How it works
-
-The Mk19 pipeline runs in five stages.
 
 ### 1. Chip extraction
 
@@ -45,11 +60,10 @@ dropped, and extraction is capped at 500 chips per image.
 
 ### 2. Training on natural geology
 
-The VAE trains on imagery in the project's `training data/` folder, searched recursively
-for `.tif`, `.tiff`, `.png`, `.jpg`, `.jpeg`, and `.npy` files. This folder is the
-curated "all natural geology" corpus and is the only place the model's notion of normal
-comes from. Up to 800 chips are sampled from it, budgeted evenly across the available
-images.
+The VAE trains on imagery in `training data/`, searched recursively for `.tif`, `.tiff`,
+`.png`, `.jpg`, `.jpeg`, and `.npy` files. This folder is the curated "all natural
+geology" corpus and is the only place the model's notion of normal comes from. Up to 800
+chips are sampled from it, budgeted evenly across the available images.
 
 Two mechanisms keep anomalies from being absorbed into that baseline:
 
@@ -61,14 +75,14 @@ Two mechanisms keep anomalies from being absorbed into that baseline:
 - **Augmentation.** Random 90° rotations and horizontal flips force the model to learn
   geology *statistics* rather than memorize individual chips.
 
-The uploaded scene is then scored against this fixed baseline. Normalization statistics,
-the anomaly threshold, and confidence z-scores all come from the training distribution,
-so a score means "how far from known-natural" rather than "how weird relative to this
+The scene is then scored against this fixed baseline. Normalization statistics, the
+anomaly threshold, and confidence z-scores all come from the training distribution, so a
+score means "how far from known-natural" rather than "how weird relative to this
 particular scene."
 
 If the training folder is missing or holds fewer than 8 usable chips, the pipeline falls
-back to self-supervised trimmed training on the uploaded scene itself and says so in the
-job log and in the result summary's `baseline` field.
+back to self-supervised trimmed training on the scene itself and says so in the job log
+and in the result summary's `baseline` field.
 
 ### 3. Scoring
 
@@ -77,88 +91,99 @@ enters the ranking. Five metrics are computed per chip and combined:
 
 | Metric | Weight | What it measures |
 | --- | --- | --- |
-| `mse` | 0.30 | **Patch-wise maximum** reconstruction error. Error is pooled over local windows and the maximum is taken, so a small artifact dominates its chip instead of being averaged away by 65k background pixels. |
-| `edge` | 0.25 | Orientation-invariant edge regularity. Combines row/column alignment of strong edges with FFT angular-spectrum concentration — natural terrain has an isotropic spectrum, while a straight edge at *any* angle concentrates energy in a narrow angular band. |
+| `mse` | 0.30 | **Patch-wise maximum** reconstruction error. Error is pooled over local windows and the maximum taken, so a small artifact dominates its chip instead of being averaged away by 65k background pixels. |
+| `edge` | 0.25 | Orientation-invariant edge regularity. Row/column alignment of strong edges plus FFT angular-spectrum concentration — natural terrain has an isotropic spectrum, while a straight edge at *any* angle concentrates energy in a narrow angular band. |
 | `contextual` | 0.20 | Compact locally-deviant region, **bright or dark**, plus texture-outlier fraction. The two-sided test catches shadowed hardware as well as sunlit hardware. |
-| `latent` | 0.15 | Robust per-dimension z-distance in latent space, with median/MAD statistics fit on inlier baseline chips only so anomalies cannot contaminate the reference distribution. |
+| `latent` | 0.15 | Robust per-dimension z-distance in latent space, with median/MAD statistics fit on inlier baseline chips only, so anomalies cannot contaminate the reference distribution. |
 | `gradient` | 0.10 | Local gradient irregularity relative to a smoothed gradient field. |
 
 Edge regularity carries real weight because straight lines at arbitrary orientation are
 the strongest geology-versus-technology discriminator available in a single grayscale
-chip.
+chip. The harness's metric breakdown bears this out: on injected targets `edge` runs
+0.98–1.00 against 0.43–0.51 for natural false positives, the widest margin of any metric.
 
 ### 4. Normalization and confidence
 
 Each metric is converted to a robust z-score (median/MAD, fit on the training baseline)
-and squashed through a sigmoid, rather than min-max scaled. Min-max normalization let a
-single extreme chip compress everything else into a narrow band; median/MAD does not.
+and squashed through a sigmoid, rather than min-max scaled. Min-max let a single extreme
+chip compress everything else into a narrow band; median/MAD does not.
 
 Confidence is the sigmoid of the combined score's robust z, **centered at z = 2**. A chip
 two robust sigmas above the baseline median lands at 0.5; four sigmas reaches about 0.88.
 The practical consequence is that the top-ranked chip is not automatically "confident" —
 if a scene contains nothing but natural geology, every chip in it scores low. That
-property is what makes the output usable as a review queue instead of a forced ranking.
+property is what makes the output a review queue rather than a forced ranking.
 
 A chip is flagged `is_anomaly` when its combined score exceeds the 92nd percentile of the
 baseline distribution.
 
-### 5. Output
+### 5. Fine localization
 
-The top 12 chips are returned with base64 PNG thumbnails, a feature bounding box within
-the chip, per-metric normalized values, and calibrated confidence.
+The top-ranked chips get a stage-2 dense sliding-window heatmap scoring every sub-patch
+on background deviation, texture outlierness, and directional edge regularity. This
+returns `fine_bbox` in **image pixel coordinates** — a box around the feature itself
+rather than the 256 px chip containing it. On the demo fixtures this narrows a detection
+from 65,536 px² to roughly 3,000 px², about a 20× reduction in what a human has to scan.
 
-## Running it
+### 6. Determinism
+
+Runs are seeded by default (`config["seed"]`, default `0`). VAE weight init, augmentation
+sampling, and batch shuffling are all stochastic, and unseeded run-to-run spread on the
+demo fixtures was large enough (mean separation swinging ±0.1, one region from +0.26 to
++0.08) to swamp the effect of a config change. Set `seed` to `null` for nondeterministic
+runs.
+
+## Running the web app
 
 ### Dependencies
 
 ```bash
-pip install numpy scipy pillow flask flask-cors loguru
-pip install torch        # optional, enables the VAE — strongly recommended
-pip install rasterio     # optional, GeoTIFF support
+pip install -r requirements.txt
 ```
 
-Both optional dependencies degrade gracefully. Without `torch`, scoring falls back to a
-NumPy-only robust scorer that substitutes a smooth-background residual for the VAE
-reconstruction error and a statistical fingerprint distance for the latent metric — the
-pipeline still runs, but detection quality drops. Without `rasterio`, image loading falls
+`torch` and `rasterio` are optional. Without `torch`, scoring falls back to a NumPy robust
+scorer that substitutes a smooth-background residual for VAE reconstruction error and a
+statistical fingerprint distance for the latent metric; the pipeline runs and still finds
+the demo targets, but detection quality drops. Without `rasterio`, image loading falls
 back to Pillow and GeoTIFF metadata is ignored.
 
-### Local development
+### Local and production
 
 ```bash
-python xenarch_mk19_script.py
-# → http://0.0.0.0:5000
+python xenarch_mk19_script.py          # dev, → http://0.0.0.0:5000
+gunicorn xenarch_mk19_script:app       # production; see Procfile
 ```
 
-### Production
-
-```bash
-gunicorn xenarch_mk19_script:app
-```
+**Run a single worker.** Job state lives in process memory, so a client polling
+`/api/progress` against a second worker gets a 404 for a job that is running fine
+elsewhere. The `Procfile` pins `--workers 1 --threads 4`. Finished jobs (and their chip
+scratch directories) are evicted after `XENARCH_JOB_TTL` seconds or once more than
+`XENARCH_MAX_JOBS` are retained.
 
 ### Environment variables
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `XENARCH_TRAINING_DIR` | `./training data` | Natural-geology corpus the VAE trains on. |
-| `PORT` | `5000` | HTTP port. |
-| `HOST` | `0.0.0.0` | Bind address. |
-| `ALLOWED_ORIGINS` | `*` | Comma-separated CORS origins. Tighten this before any real deployment. |
+| `PORT` / `HOST` | `5000` / `0.0.0.0` | Bind address. |
+| `ALLOWED_ORIGINS` | `*` | Comma-separated CORS origins. Left permissive for first deployment; the server logs a warning at startup while it is `*`. Set it before exposing the API. |
+| `XENARCH_JOB_TTL` | `3600` | Seconds to retain finished jobs. |
+| `XENARCH_MAX_JOBS` | `32` | Max jobs retained in memory. |
 | `FLASK_DEBUG` | `0` | Set to `1` for Flask debug mode. |
 
 ## HTTP API
 
 | Endpoint | Method | Description |
 | --- | --- | --- |
-| `/` | GET | Embedded web frontend: drag-and-drop upload, live job log, ranked detections. |
-| `/api/status` | GET | Health check. Reports version, whether torch/rasterio are available, the training directory, and how many training images were found. |
-| `/api/analyze` | POST | Multipart upload. `files[]` = one or more images; optional `config` form field carrying a JSON config object. Returns `{"job_id": ...}` and runs the analysis on a background thread. |
-| `/api/progress/<job_id>` | GET | Current step, percent complete, last 50 log lines, done flag, error. |
-| `/api/results/<job_id>` | GET | Ranked detections plus a summary. Returns 202 while still running, 500 if the job failed. |
+| `/` | GET | Embedded frontend: drag-and-drop upload, live job log, ranked detections. |
+| `/api/status` | GET | Health check: version, torch/rasterio availability, training dir and image count, active baseline, combined weights, job counts. |
+| `/api/analyze` | POST | Multipart upload. `files[]` = one or more images; optional `config` form field with a JSON config object. Returns `{"job_id": ...}` and runs on a background thread. |
+| `/api/progress/<job_id>` | GET | Step, percent, last 50 log lines, done flag, error. |
+| `/api/results/<job_id>` | GET | Ranked detections plus summary. 202 while running, 500 if the job failed. |
 
 ### Job configuration
 
-All keys are optional; these are the defaults.
+All keys optional; these are the defaults.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -172,74 +197,96 @@ All keys are optional; these are the defaults.
 | `warmup_epochs` | `3` | KL warmup length; trimmed training begins after this. |
 | `trim_frac` | `0.08` | Fraction of worst-reconstructing chips excluded from gradient updates, clamped to `[0, 0.4]`. |
 | `max_train_chips` | `800` | Cap on baseline chips sampled from the training folder. |
-| `training_dir` | `XENARCH_TRAINING_DIR` | Per-job override of the training corpus. |
+| `max_chips` | `500` | Cap on chips extracted per scene. |
+| `localize_top_n` | `5` | How many top chips get stage-2 fine localization. |
+| `training_dir` | env default | Per-job override of the training corpus. |
+| `seed` | `0` | RNG seed; `null` for nondeterministic. |
 
-Training stability is handled with gradient-norm clipping at 1.0, `logvar` clamping to
-`[-10, 10]`, small-gain Xavier initialization on the latent heads, `ReduceLROnPlateau`
-scheduling, and a NaN guard that aborts training rather than propagating garbage.
+Training stability comes from gradient-norm clipping at 1.0, `logvar` clamping to
+`[-10, 10]`, small-gain Xavier init on the latent heads, `ReduceLROnPlateau` scheduling,
+and a NaN guard that aborts training rather than propagating garbage.
 
 ## Evaluation
 
-`eval_harness.py` measures whether the detector actually separates real targets from
-known-hard false positives, on a tuning split and a held-out split.
+`eval_harness.py` measures whether the detector separates real targets from known-hard
+natural false positives, on a tuning split and a held-out split.
 
 ```bash
-python eval_harness.py --iteration 1
-python eval_harness.py --iteration 2 --config my_config.json
-python eval_harness.py --status
+python inject_anomalies.py --demo                                  # build fixtures
+python eval_harness.py --iteration 1 --config eval_config_demo.json
+python eval_harness.py --status                                    # progress log
 ```
 
 The core metric is **separation**: mean confidence over `target` chips minus mean
 confidence over `false_positive` chips, per region. The harness reports per-region
-separation, aggregate mean and worst-case separation per split, a per-metric breakdown
-for diagnosis, and a summary by anomaly type.
-
-It stops on one of three conditions:
-
-- **Success** — both tuning and held-out mean separation exceed the threshold (default 0.30).
-- **Overfitting plateau** — tuning separation improved while held-out separation stagnated
-  across `overfit_patience` iterations (default 2). The harness explicitly tells you not to
-  proceed with the current changes.
-- **Iteration cap** — default 6.
+separation, aggregate mean and worst-case per split, a per-metric breakdown, and a
+summary by anomaly type. It stops on success (both splits above threshold, default 0.30),
+on an overfitting plateau (tuning improves while held-out stagnates across
+`overfit_patience` iterations), or at the iteration cap.
 
 Results land in `results/iteration_N/` as `report.json` plus per-region `chip_labels.csv`,
-with a cumulative `results/progress_log.csv` recording every iteration's weights and
-separation figures.
+with a cumulative `results/progress_log.csv`.
 
-### Expected inputs
+### Reproducible baseline
 
-The harness reads:
+`python inject_anomalies.py --demo --seed 1234` then the command above yields:
 
-- `eval/regions.json` — list of regions, each with `region_id`, `split`
-  (`tuning` | `held-out`), `anomaly_type`, and an optional `chip_size` override.
-- `eval/<region_id>/ground_truth.json` — `image_path` plus `zones`, each a bounding box
-  labeled `target`, `false_positive`, or `background`. Chips are assigned by center point,
-  first matching zone wins.
+| Split | Mean separation | Worst region |
+| --- | --- | --- |
+| Tuning | **+0.403** | `region_03_linear_tuning` (+0.229) |
+| Held-out | **+0.441** | `region_06_grid_held` (+0.162) |
 
-## Known gaps
+The injected target ranks in the top 3 of 49 chips in 5 of 6 regions, and first in 4.
+By anomaly type: rectilinear structures +0.536, compact bright objects +0.536, linear
+features +0.229, regular grids +0.162. **The two weakest types are the honest result
+here** — thin linear tracks and low-contrast repeating grids are where this detector is
+softest, and they are the place to aim the next tuning iteration.
 
-These are real and worth knowing before you rely on any of this:
+`eval_config_demo.json` uses 6 epochs and 150 baseline chips to keep a full 6-region run
+to a few minutes. Production defaults (20 epochs, 800 chips) score higher and take
+proportionally longer.
 
-- **No evaluation data is committed.** The `eval/` tree, the `training data/` corpus, and
-  the `results/` output directory are all absent from the repository. The harness cannot
-  run as checked out, and the Apollo 11 result above cannot currently be reproduced from
-  this repo alone.
-- **The harness evaluates the wrong model.** `eval_harness.py` imports `run_pipeline` from
-  `xenarch_pipeline.py`, which still carries Mk17-era scoring: non-overlapping chips,
-  min-max normalization, an `mse`/`density`-dominated weight vector
-  (0.60 / 0.30 / 0.05 / 0.05 / 0.00), and a VAE path that is off by default and lacks
-  trimmed training. Numbers it produces do **not** describe Mk19. Bringing the Mk19 scorer
-  behind the harness's interface is the highest-value next change.
-- **Missing packaging files.** `requirements.txt` and the `Procfile` referenced in the Mk19
-  module docstring are not in the repository. Install dependencies with the pip commands
-  above until they are added.
-- **Fine localization only exists in the old pipeline.** `xenarch_pipeline.py` has a
-  stage-2 `localize_within_chip` step that produces a pixel-coordinate `fine_bbox` via a
-  dense sliding-window heatmap. Mk19 returns only a coarse chip-relative `feature_bbox`.
-- **In-memory job state.** `PROGRESS` and `RESULTS` are process-local dictionaries that
-  are never evicted. A multi-worker gunicorn deployment will lose jobs across workers, and
-  a long-lived single worker will grow without bound.
-- **CORS defaults to `*`.** Convenient for a first deployment, wrong for anything exposed.
+### What the fixtures are, and are not
+
+`inject_anomalies.py` generates the fixtures because real spacecraft imagery does not
+arrive with labeled artificial features. Each region gets one injected target
+(rectilinear structure, compact bright object, linear feature, or regular grid) plus two
+natural distractors that are deliberately hard — a bright-rimmed crater and a boulder
+field, both high-contrast and compact.
+
+`--demo` also synthesizes the natural terrain and writes a clean baseline into
+`training data/`, so the whole stack runs with no external data. Point `--source` at your
+own natural imagery to inject into real geology instead.
+
+**These targets are synthetic.** Good separation here shows the detector distinguishes
+hard-edged artificial geometry from natural terrain — necessary, not sufficient. It is a
+regression guard for tuning, not evidence about real orbital imagery of real hardware.
+Validate on real scenes separately.
+
+Zone labeling is derived from each feature's actual pixel extent: a zone covers exactly
+the chip centers whose chip *fully contains* the feature. This matters more than it
+sounds. An earlier fixed half-width labeled chips holding only a clipped corner of the
+target as `target`, which dragged target confidence down and understated separation by
+roughly 0.25 — the harness was measuring the fixture rather than the model.
+
+## Known limitations
+
+- **Synthetic evaluation only.** See above. There is no committed real-imagery benchmark.
+- **The baseline VAE retrains per scene.** The harness trains from scratch for each of the
+  6 regions against the same baseline corpus, which is ~6× more compute than needed. The
+  fix is to train once, persist the weights and the baseline normalization statistics, and
+  reuse them across scenes — worth doing before the corpus grows.
+- **Weakest on linear and grid targets** (+0.229 / +0.162 against a 0.30 threshold).
+- **`training data/` and `eval/` are gitignored.** Imagery is large and often not ours to
+  redistribute; the demo fixtures are regenerable from a seed. Supply your own corpus for
+  real work — detection quality is bounded by how well it represents the target terrain.
+- **Single-process job state**, as described under Running the web app.
+- **CORS defaults to `*`.** Convenient for first deployment, wrong for anything exposed.
+- **The Mk17 engine is not comparable on these fixtures.** `{"engine": "mk17"}` runs the
+  frozen legacy scorer, but its non-overlapping tiling produces 16 chips per scene and its
+  chip centers miss most labeled zones entirely, so separation is uncomputable for 4 of 6
+  regions. Where a target chip does land, it ranks 9th and 12th of 16, against a Mk19 median
+  rank of 1 of 49 on the same fixtures. That is a demonstration that overlap was load-bearing, not a clean A/B.
 
 ## Design intent
 
@@ -255,3 +302,8 @@ fixed natural baseline rather than against the current scene, a scene of ordinar
 produces uniformly low confidence instead of a confidently-ranked list of ordinary rocks.
 The output is a review queue for humans, and a review queue that cries wolf on every scene
 is worse than none.
+
+A third property is structural: **the harness must measure the shipping model.** Keeping
+one implementation in `xenarch_core.py` is what makes the separation numbers above mean
+anything. When the web app and the harness drifted apart, the harness was scoring code
+nobody ran.
