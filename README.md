@@ -89,11 +89,11 @@ and in the result summary's `baseline` field.
 
 #### 4.2 Data repository used
 
--https://pds-imaging.jpl.nasa.gov/tools/atlas/search?gather.common.mission=mro&gather.common.instrument=CTX
--https://pds-imaging.jpl.nasa.gov/tools/atlas/search?gather.common.mission=lro
--https://pds-imaging.jpl.nasa.gov/tools/atlas/search?gather.common.spacecraft=mars_global_surveyor&gather.common.instrument=MOC
--https://pradan.issdc.gov.in/ch2/protected/browse.xhtml?id=tmc2
--https://pradan.issdc.gov.in/ch2/protected/browse.xhtml
+- https://pds-imaging.jpl.nasa.gov/tools/atlas/search?gather.common.mission=mro&gather.common.instrument=CTX
+- https://pds-imaging.jpl.nasa.gov/tools/atlas/search?gather.common.mission=lro
+- https://pds-imaging.jpl.nasa.gov/tools/atlas/search?gather.common.spacecraft=mars_global_surveyor&gather.common.instrument=MOC
+- https://pradan.issdc.gov.in/ch2/protected/browse.xhtml?id=tmc2
+- https://pradan.issdc.gov.in/ch2/protected/browse.xhtml
 
 ### 3. Scoring
 
