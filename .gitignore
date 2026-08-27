@@ -8,9 +8,9 @@ venv/
 # Harness output
 results/
 
-# Data. Imagery is large and usually not ours to redistribute; the training
-# corpus and eval fixtures are rebuilt locally:
-#   python inject_anomalies.py --demo --seed 1234
+# Data. Imagery is large and usually not ours to redistribute. Supply the
+# natural-geology training corpus and the labeled eval regions locally; see
+# the README and the eval_harness.py docstring for the expected layout.
 training data/
 eval/
 *.tif

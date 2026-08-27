@@ -14,28 +14,31 @@ is the choice of what goes into the natural-geology training folder.
 ## Status
 
 Mk19 is current. The detection algorithm lives in **`xenarch_core.py`** and has exactly
-one implementation, used by both the web application and the evaluation harness.
+one implementation, used by both the web application and the evaluation harness — so the
+harness measures the model that actually ships.
 
 In testing over Apollo landing-site imagery, the pipeline ranked the Apollo 11 landing
 site hardware among its top anomaly detections without any prior knowledge of the site.
 No artifacts from that run are committed here, so it is not reproducible from this
-repository — it is recorded as project testing, not as a benchmark. What *is*
-reproducible is the synthetic harness below.
+repository; it is recorded as project testing, not as a benchmark.
+
+**No imagery ships with this repository — no training corpus and no evaluation data.**
+There are therefore no measured performance numbers in this README. Supply data as
+described under [Providing data](#providing-data), then run the harness to produce your
+own. The code paths are exercised and working; what is missing is data to point them at.
 
 ## Quick start
 
 ```bash
 pip install -r requirements.txt
 
-# Build a labeled fixture set and a clean natural baseline (no external data needed)
-python inject_anomalies.py --demo
-
-# Score the detector against it
-python eval_harness.py --iteration 1 --config eval_config_demo.json
-
-# Or run the web app
+# Put natural-geology imagery in ./training data/  (see Providing data)
 python xenarch_mk19_script.py     # → http://0.0.0.0:5000
 ```
+
+With an empty training folder the pipeline still runs, falling back to self-supervised
+mode and saying so — but the fixed-baseline behavior that makes scores mean "how far from
+natural" only exists once you supply a corpus.
 
 ## Repository contents
 
@@ -45,8 +48,6 @@ python xenarch_mk19_script.py     # → http://0.0.0.0:5000
 | `xenarch_mk19_script.py` | Web layer only: upload handling, job tracking, embedded frontend, JSON API. Calls the core. |
 | `xenarch_pipeline.py` | Harness-facing `run_pipeline()`. Calls the same core. Also holds a frozen Mk17 scorer for comparison. |
 | `eval_harness.py` | Iterative evaluation: per-region separation, tuning vs. held-out splits, stopping criteria. |
-| `inject_anomalies.py` | Builds labeled evaluation fixtures — synthetic anomalies at known coordinates. |
-| `eval_config_demo.json` | Fast config used by the reproducible run below. |
 
 ## How it works
 
@@ -97,10 +98,10 @@ enters the ranking. Five metrics are computed per chip and combined:
 | `latent` | 0.15 | Robust per-dimension z-distance in latent space, with median/MAD statistics fit on inlier baseline chips only, so anomalies cannot contaminate the reference distribution. |
 | `gradient` | 0.10 | Local gradient irregularity relative to a smoothed gradient field. |
 
-Edge regularity carries real weight because straight lines at arbitrary orientation are
-the strongest geology-versus-technology discriminator available in a single grayscale
-chip. The harness's metric breakdown bears this out: on injected targets `edge` runs
-0.98–1.00 against 0.43–0.51 for natural false positives, the widest margin of any metric.
+Edge regularity carries real weight on the reasoning that straight lines at arbitrary
+orientation are the strongest geology-versus-technology discriminator available in a
+single grayscale chip. That weighting is a design judgment, not yet a measured one —
+confirming it against real labeled data is a first job for the harness.
 
 ### 4. Normalization and confidence
 
@@ -122,16 +123,83 @@ baseline distribution.
 The top-ranked chips get a stage-2 dense sliding-window heatmap scoring every sub-patch
 on background deviation, texture outlierness, and directional edge regularity. This
 returns `fine_bbox` in **image pixel coordinates** — a box around the feature itself
-rather than the 256 px chip containing it. On the demo fixtures this narrows a detection
-from 65,536 px² to roughly 3,000 px², about a 20× reduction in what a human has to scan.
+rather than the 256 px chip containing it, so a reviewer is pointed at the feature
+instead of a 65,536 px² tile.
 
 ### 6. Determinism
 
 Runs are seeded by default (`config["seed"]`, default `0`). VAE weight init, augmentation
-sampling, and batch shuffling are all stochastic, and unseeded run-to-run spread on the
-demo fixtures was large enough (mean separation swinging ±0.1, one region from +0.26 to
-+0.08) to swamp the effect of a config change. Set `seed` to `null` for nondeterministic
-runs.
+sampling, and batch shuffling are all stochastic, and unseeded runs on identical inputs
+differ enough to obscure the effect of a config change — which would leave an iterative
+tuning harness unable to separate a real improvement from noise. Set `seed` to `null` for
+nondeterministic runs.
+
+## Providing data
+
+Nothing here ships with imagery. Two separate things need supplying.
+
+### Training corpus — required for real use
+
+Put natural-geology imagery in `training data/` (or point `XENARCH_TRAINING_DIR` /
+`config["training_dir"]` elsewhere). Subfolders are searched recursively;
+`.tif`, `.tiff`, `.png`, `.jpg`, `.jpeg`, `.npy` are accepted.
+
+This corpus defines "normal," so detection quality is bounded by how well it represents
+the terrain you intend to scan. Match illumination geometry, resolution, and terrain type
+to the scenes you will score — a baseline built from one and applied to the other will
+flag the mismatch itself as anomalous. Trimmed training tolerates incidental
+contamination, but the corpus should be natural geology by intent.
+
+### Evaluation data — required only for the harness
+
+`eval_harness.py` needs labeled regions. Without them it exits with a message describing
+the layout rather than a traceback.
+
+```
+eval/regions.json
+eval/<region_id>/ground_truth.json
+eval/<region_id>/<scene image>
+```
+
+`eval/regions.json`:
+
+```json
+{"regions": [{"region_id":    "apollo_11",
+              "split":        "tuning",
+              "anomaly_type": "lander",
+              "chip_size":    256}]}
+```
+
+`split` is `tuning` or `held-out`; `anomaly_type` is a free-form label used only to group
+the per-type summary; `chip_size` is an optional per-region override.
+
+`eval/<region_id>/ground_truth.json`:
+
+```json
+{"image_path": "eval/apollo_11/scene.tif",
+ "low_confidence": false,
+ "zones": [{"label": "target",         "bbox": [x1, y1, x2, y2]},
+           {"label": "false_positive", "bbox": [x1, y1, x2, y2]},
+           {"label": "background",     "bbox": [0, 0, w, h]}]}
+```
+
+Two details matter when drawing zones:
+
+**Order them target/false-positive first.** A chip is labeled by whether its center falls
+inside a zone, first match winning, so a catch-all `background` zone must come last.
+
+**Size them to containment, not to the feature.** A chip of width `chip_size` centered at
+`c` spans `[c - chip_size/2, c + chip_size/2]`, so the chips that *fully contain* a
+feature spanning `[f1, f2]` are exactly those with center in
+`[f2 - chip_size/2, f1 + chip_size/2]`. Drawing the zone tightly around the feature
+instead under-labels — chips that genuinely contain it get scored as background. Drawing
+it wider over-labels, tagging chips that hold only a clipped corner as `target`, which
+drags target confidence down and understates separation. Either way the harness ends up
+measuring the labeling rather than the model.
+
+A region needs at least one `target` and one `false_positive` chip to produce a
+separation score. Good `false_positive` zones are the natural features that are *hard* —
+bright-rimmed fresh craters, boulder fields, high-contrast scarps — not empty terrain.
 
 ## Running the web app
 
@@ -143,9 +211,9 @@ pip install -r requirements.txt
 
 `torch` and `rasterio` are optional. Without `torch`, scoring falls back to a NumPy robust
 scorer that substitutes a smooth-background residual for VAE reconstruction error and a
-statistical fingerprint distance for the latent metric; the pipeline runs and still finds
-the demo targets, but detection quality drops. Without `rasterio`, image loading falls
-back to Pillow and GeoTIFF metadata is ignored.
+statistical fingerprint distance for the latent metric; the pipeline runs, but detection
+quality drops. Without `rasterio`, image loading falls back to Pillow and GeoTIFF metadata
+is ignored.
 
 ### Local and production
 
@@ -201,6 +269,7 @@ All keys optional; these are the defaults.
 | `localize_top_n` | `5` | How many top chips get stage-2 fine localization. |
 | `training_dir` | env default | Per-job override of the training corpus. |
 | `seed` | `0` | RNG seed; `null` for nondeterministic. |
+| `engine` | `"mk19"` | `"mk17"` selects the frozen legacy scorer, for comparison only. |
 
 Training stability comes from gradient-norm clipping at 1.0, `logvar` clamping to
 `[-10, 10]`, small-gain Xavier init on the latent heads, `ReduceLROnPlateau` scheduling,
@@ -212,81 +281,47 @@ and a NaN guard that aborts training rather than propagating garbage.
 natural false positives, on a tuning split and a held-out split.
 
 ```bash
-python inject_anomalies.py --demo                                  # build fixtures
-python eval_harness.py --iteration 1 --config eval_config_demo.json
-python eval_harness.py --status                                    # progress log
+python eval_harness.py --iteration 1
+python eval_harness.py --iteration 2 --config my_config.json
+python eval_harness.py --status
 ```
 
 The core metric is **separation**: mean confidence over `target` chips minus mean
 confidence over `false_positive` chips, per region. The harness reports per-region
-separation, aggregate mean and worst-case per split, a per-metric breakdown, and a
-summary by anomaly type. It stops on success (both splits above threshold, default 0.30),
-on an overfitting plateau (tuning improves while held-out stagnates across
-`overfit_patience` iterations), or at the iteration cap.
+separation, aggregate mean and worst-case per split, a per-metric breakdown showing which
+metric is carrying the discrimination, and a summary by anomaly type.
+
+It stops on one of three conditions:
+
+- **Success** — both tuning and held-out mean separation exceed the threshold (default 0.30).
+- **Overfitting plateau** — tuning separation improved while held-out stagnated across
+  `overfit_patience` iterations (default 2). The harness explicitly tells you not to
+  proceed with the current changes.
+- **Iteration cap** — default 6.
 
 Results land in `results/iteration_N/` as `report.json` plus per-region `chip_labels.csv`,
-with a cumulative `results/progress_log.csv`.
+with a cumulative `results/progress_log.csv` recording every iteration's weights and
+separation figures.
 
-### Reproducible baseline
-
-`python inject_anomalies.py --demo --seed 1234` then the command above yields:
-
-| Split | Mean separation | Worst region |
-| --- | --- | --- |
-| Tuning | **+0.403** | `region_03_linear_tuning` (+0.229) |
-| Held-out | **+0.441** | `region_06_grid_held` (+0.162) |
-
-The injected target ranks in the top 3 of 49 chips in 5 of 6 regions, and first in 4.
-By anomaly type: rectilinear structures +0.536, compact bright objects +0.536, linear
-features +0.229, regular grids +0.162. **The two weakest types are the honest result
-here** — thin linear tracks and low-contrast repeating grids are where this detector is
-softest, and they are the place to aim the next tuning iteration.
-
-`eval_config_demo.json` uses 6 epochs and 150 baseline chips to keep a full 6-region run
-to a few minutes. Production defaults (20 epochs, 800 chips) score higher and take
-proportionally longer.
-
-### What the fixtures are, and are not
-
-`inject_anomalies.py` generates the fixtures because real spacecraft imagery does not
-arrive with labeled artificial features. Each region gets one injected target
-(rectilinear structure, compact bright object, linear feature, or regular grid) plus two
-natural distractors that are deliberately hard — a bright-rimmed crater and a boulder
-field, both high-contrast and compact.
-
-`--demo` also synthesizes the natural terrain and writes a clean baseline into
-`training data/`, so the whole stack runs with no external data. Point `--source` at your
-own natural imagery to inject into real geology instead.
-
-**These targets are synthetic.** Good separation here shows the detector distinguishes
-hard-edged artificial geometry from natural terrain — necessary, not sufficient. It is a
-regression guard for tuning, not evidence about real orbital imagery of real hardware.
-Validate on real scenes separately.
-
-Zone labeling is derived from each feature's actual pixel extent: a zone covers exactly
-the chip centers whose chip *fully contains* the feature. This matters more than it
-sounds. An earlier fixed half-width labeled chips holding only a clipped corner of the
-target as `target`, which dragged target confidence down and understated separation by
-roughly 0.25 — the harness was measuring the fixture rather than the model.
+The tuning/held-out split is the point of the exercise. Metric weights are hand-set, and
+hand-tuning five weights against a handful of regions overfits easily; the held-out split
+and the plateau check are what make an improvement believable.
 
 ## Known limitations
 
-- **Synthetic evaluation only.** See above. There is no committed real-imagery benchmark.
-- **The baseline VAE retrains per scene.** The harness trains from scratch for each of the
-  6 regions against the same baseline corpus, which is ~6× more compute than needed. The
-  fix is to train once, persist the weights and the baseline normalization statistics, and
-  reuse them across scenes — worth doing before the corpus grows.
-- **Weakest on linear and grid targets** (+0.229 / +0.162 against a 0.30 threshold).
-- **`training data/` and `eval/` are gitignored.** Imagery is large and often not ours to
-  redistribute; the demo fixtures are regenerable from a seed. Supply your own corpus for
-  real work — detection quality is bounded by how well it represents the target terrain.
+- **No measured performance.** No training corpus and no evaluation data ship here, so
+  nothing in this README reports detection accuracy. The metric weights are reasoned
+  design choices that have not been validated against labeled real imagery.
+- **The baseline VAE retrains per scene.** The harness trains from scratch for every
+  region against the same baseline corpus, which is roughly *N*× more compute than needed
+  for *N* regions. The fix is to train once, persist the weights and the baseline
+  normalization statistics, and reuse them across scenes — worth doing before the corpus
+  grows.
 - **Single-process job state**, as described under Running the web app.
 - **CORS defaults to `*`.** Convenient for first deployment, wrong for anything exposed.
-- **The Mk17 engine is not comparable on these fixtures.** `{"engine": "mk17"}` runs the
-  frozen legacy scorer, but its non-overlapping tiling produces 16 chips per scene and its
-  chip centers miss most labeled zones entirely, so separation is uncomputable for 4 of 6
-  regions. Where a target chip does land, it ranks 9th and 12th of 16, against a Mk19 median
-  rank of 1 of 49 on the same fixtures. That is a demonstration that overlap was load-bearing, not a clean A/B.
+- **The legacy Mk17 engine tiles without overlap**, producing far fewer chips whose
+  centers frequently miss labeled zones entirely. `{"engine": "mk17"}` runs it for
+  comparison, but expect regions to come back unscoreable rather than merely worse.
 
 ## Design intent
 
@@ -304,6 +339,6 @@ The output is a review queue for humans, and a review queue that cries wolf on e
 is worse than none.
 
 A third property is structural: **the harness must measure the shipping model.** Keeping
-one implementation in `xenarch_core.py` is what makes the separation numbers above mean
-anything. When the web app and the harness drifted apart, the harness was scoring code
-nobody ran.
+one implementation in `xenarch_core.py` is what will make the separation numbers mean
+anything once there is data to produce them. When the web app and the harness drifted
+apart, the harness was scoring code nobody ran.

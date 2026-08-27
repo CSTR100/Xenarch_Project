@@ -7,7 +7,7 @@ same code path the web app serves — so harness numbers describe the model that
 actually ships.
 
 A legacy Mk17 scorer is retained behind `config["engine"] = "mk17"` purely so the
-two can be compared on the same fixtures. It is not the product; do not tune it.
+two can be compared on the same data. It is not the product; do not tune it.
 
     from xenarch_pipeline import run_pipeline
     chips = run_pipeline("scene.png")                      # Mk19 (default)
@@ -72,7 +72,7 @@ def _run_mk19(image_path: str, cfg: Dict) -> List[Dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LEGACY MK17 SCORER  (retained only to A/B against Mk19 on the same fixtures)
+# LEGACY MK17 SCORER  (retained only to A/B against Mk19 on the same data)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _legacy_normalize(arr: np.ndarray) -> np.ndarray:

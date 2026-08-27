@@ -1,10 +1,10 @@
 """
 Xenarch iterative evaluation harness.
 
-Usage:
-    # First time: build labeled fixtures (--demo needs no external imagery)
-    python inject_anomalies.py --demo
+Requires labeled evaluation data under `eval/` (see "Expected inputs" below).
+No evaluation data ships with this repository — supply your own.
 
+Usage:
     # Run iteration 1 with default config
     python eval_harness.py --iteration 1
 
@@ -24,6 +24,32 @@ Stopping criteria (configurable):
     separation_threshold: float  (default 0.30)
     overfit_patience:     int    (default 2)
     max_iterations:       int    (default 6)
+
+Expected inputs
+---------------
+eval/regions.json
+    {"regions": [{"region_id":    "apollo_11",
+                  "split":        "tuning" | "held-out",
+                  "anomaly_type": "lander",          # free-form grouping label
+                  "chip_size":    256}]}             # optional per-region override
+
+eval/<region_id>/ground_truth.json
+    {"image_path": "eval/apollo_11/scene.tif",       # relative to this file's dir
+     "low_confidence": false,                        # flag thin/uncertain labeling
+     "zones": [{"label": "target",         "bbox": [x1, y1, x2, y2]},
+               {"label": "false_positive", "bbox": [x1, y1, x2, y2]},
+               {"label": "background",     "bbox": [x1, y1, x2, y2]}]}
+
+A chip is labeled by whether its CENTER falls inside a zone, first match winning,
+so list `target` and `false_positive` before any catch-all `background` zone. A
+chip of width `chip_size` centred at c spans [c - chip_size/2, c + chip_size/2],
+so to label exactly the chips that fully contain a feature spanning [f1, f2], use
+a zone from f2 - chip_size/2 to f1 + chip_size/2. A wider zone labels chips that
+hold only a clipped corner of the feature as `target`, which drags target
+confidence down and understates separation.
+
+`separation` is the mean confidence over `target` chips minus the mean over
+`false_positive` chips, so a region needs at least one of each to score.
 """
 from __future__ import annotations
 
@@ -56,17 +82,35 @@ HARNESS_DEFAULTS = {
 
 # ── ground truth loading ───────────────────────────────────────────────────
 
+DATA_HELP = (
+    "No evaluation data found. This repository ships none — supply your own.\n"
+    "Expected layout (see the module docstring for the full schema):\n"
+    "    eval/regions.json\n"
+    "    eval/<region_id>/ground_truth.json\n"
+    "    eval/<region_id>/<scene image>\n"
+)
+
+
 def load_ground_truth(region_id: str) -> Dict:
     path = BASE / "eval" / region_id / "ground_truth.json"
     if not path.exists():
-        raise FileNotFoundError(f"Missing ground truth: {path}")
+        raise FileNotFoundError(
+            f"Missing ground truth for region {region_id!r}: {path}")
     with open(path) as f:
         return json.load(f)
 
 
 def load_regions() -> List[Dict]:
-    with open(BASE / "eval" / "regions.json") as f:
-        return json.load(f)["regions"]
+    path = BASE / "eval" / "regions.json"
+    if not path.exists():
+        print(f"\n{DATA_HELP}\nLooked for: {path}\n", file=sys.stderr)
+        sys.exit(2)
+    with open(path) as f:
+        regions = json.load(f).get("regions", [])
+    if not regions:
+        print(f"\n{path} lists no regions.\n{DATA_HELP}", file=sys.stderr)
+        sys.exit(2)
+    return regions
 
 
 # ── zone matching ──────────────────────────────────────────────────────────
@@ -520,7 +564,7 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""
             Workflow:
-              1.  python inject_anomalies.py --demo   # one-time setup
+              1.  Populate eval/ with labeled regions (see module docstring)
               2.  python eval_harness.py --iteration 1
               3.  Examine report, adjust config JSON
               4.  python eval_harness.py --iteration 2 --config updated.json
