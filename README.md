@@ -11,6 +11,8 @@ The model is never told what an anomaly looks like. There are no anomaly labels,
 positive class, and no training examples of artificial structures. The only supervision
 is the choice of what goes into the natural-geology training folder.
 
+
+
 ## Status
 
 Mk19 is current. The detection algorithm lives in **`xenarch_core.py`** and has exactly
@@ -84,6 +86,14 @@ particular scene."
 If the training folder is missing or holds fewer than 8 usable chips, the pipeline falls
 back to self-supervised trimmed training on the scene itself and says so in the job log
 and in the result summary's `baseline` field.
+
+#### 4.2 Data repository used
+
+-https://pds-imaging.jpl.nasa.gov/tools/atlas/search?gather.common.mission=mro&gather.common.instrument=CTX
+-https://pds-imaging.jpl.nasa.gov/tools/atlas/search?gather.common.mission=lro
+-https://pds-imaging.jpl.nasa.gov/tools/atlas/search?gather.common.spacecraft=mars_global_surveyor&gather.common.instrument=MOC
+-https://pradan.issdc.gov.in/ch2/protected/browse.xhtml?id=tmc2
+-https://pradan.issdc.gov.in/ch2/protected/browse.xhtml
 
 ### 3. Scoring
 
