@@ -15,3 +15,6 @@ training data/
 eval/
 *.tif
 *.tiff
+
+# Scratch run output (chips are regenerated per run)
+data/xenarch_run/chips/
