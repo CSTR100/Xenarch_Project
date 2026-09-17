@@ -81,8 +81,12 @@ def _hirise_url(doc):
 
 
 def _ctx_url(doc):
-    # Best-effort reconstruction from the Atlas record; see the CTX note above.
-    return doc["ATLAS_VOLUME_URL"] + "/" + doc["FILE_PATH"] + "/" + doc["FILE_NAME_SPECIFICATION"]
+    # The Atlas record's ATLAS_VOLUME_URL still points at the retired
+    # .../data/mro/mars_reconnaissance_orbiter/ctx/ tree (404s since ~2026);
+    # the volumes now live under .../data/mro/ctx/.
+    volume = doc["ATLAS_VOLUME_URL"].rstrip("/").rsplit("/", 1)[-1]
+    return ("https://pds-imaging.jpl.nasa.gov/data/mro/ctx/" + volume + "/"
+            + doc["FILE_PATH"] + "/" + doc["FILE_NAME_SPECIFICATION"])
 
 
 def _moc_url(doc):
@@ -118,40 +122,123 @@ DATASETS = {
         "build_url": _lroc_url,
         "filename_field": "FILE_SPECIFICATION_NAME",
     },
+    "clementine": {
+        # Lunar global mapping mission (1994), ~600k UVVIS frames. The raw
+        # EDRs use Clementine-JPEG compression (undecodable without ISIS), so
+        # download the archive's browse JPEG instead -- UVVIS native resolution
+        # is only 384x288, and the browse JPEG is that full size.
+        "label": "Clementine UVVIS (Moon)",
+        "fq": ["ATLAS_MISSION_NAME:clementine", "ATLAS_INSTRUMENT_NAME:uvvis"],
+        "build_url": lambda doc: doc["ATLAS_BROWSE_URL"],
+        "filename_field": "ATLAS_BROWSE_URL",
+    },
+    "lroc-wac": {
+        # Same archive as lroc but restricted to the Wide Angle Camera:
+        # WAC frames are a few MB instead of the ~500 MB NAC strips, which
+        # makes sampling the Moon at scale practical.
+        "label": "LROC WAC (Lunar Reconnaissance Orbiter, wide-angle)",
+        "fq": ["ATLAS_INSTRUMENT_NAME:lroc", "FILE_SPECIFICATION_NAME:*WAC*"],
+        "build_url": _lroc_url,
+        "filename_field": "FILE_SPECIFICATION_NAME",
+    },
 }
+
+
+# --- thumbnail pre-filter -------------------------------------------------------
+
+def _fix_extras_url(u):
+    # The Atlas index still points thumbnails/browse at retired hosts/paths.
+    u = u.replace("https://pdsimg.jpl.nasa.gov//data/mro/mars_reconnaissance_orbiter/ctx/",
+                  "https://pds-imaging.jpl.nasa.gov/data/mro/ctx/")
+    return u
+
+
+def _looks_blank(arr):
+    """Shared blank test: True when an 8-bit grayscale array is a white-out,
+    black frame, or mostly data gaps -- judged on the interior (nonzero) pixels."""
+    interior = arr[arr > 0]
+    return (interior.size < arr.size * 0.05 or interior.std() < 6
+            or (interior > 230).mean() > 0.6 or interior.mean() < 25)
+
+
+def thumbnail_is_blank(doc):
+    """Fetch the catalog's tiny thumbnail (a few KB) and test it for blankness
+    BEFORE spending a full-product download. Returns True (blank -- skip),
+    False (looks fine), or None (no usable thumbnail -- download anyway)."""
+    url = doc.get("ATLAS_THUMBNAIL_URL") or doc.get("ATLAS_BROWSE_URL")
+    if not url:
+        return None
+    try:
+        import io
+        import numpy as np
+        from PIL import Image
+        req = urllib.request.Request(_fix_extras_url(url),
+                                     headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = r.read()
+        arr = np.asarray(Image.open(io.BytesIO(data)).convert("L"), dtype="float32")
+        return bool(_looks_blank(arr))
+    except Exception:
+        return None
 
 
 # --- Solr search helpers -------------------------------------------------------
 
-def solr_query(fq, count, start=0):
-    params = {"q": "*:*", "fq": fq, "rows": str(count), "start": str(start), "wt": "json"}
+def _solr_get(params, retries=4):
+    """Catalog query with retry -- the Atlas Solr endpoint throws transient
+    502/503s under load, which shouldn't kill a long sampling run."""
     qs = urllib.parse.urlencode(params, doseq=True)
     req = urllib.request.Request(f"{SOLR_URL}?{qs}", headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data = json.load(resp)
+    for attempt in range(1, retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.load(resp)
+        except Exception as e:
+            if attempt == retries:
+                raise
+            print(f"    catalog query attempt {attempt}/{retries} failed ({e}), retrying")
+            time.sleep(5 * attempt)
+
+
+def solr_query(fq, count, start=0):
+    data = _solr_get({"q": "*:*", "fq": fq, "rows": str(count),
+                      "start": str(start), "wt": "json"})
     return data["response"]["docs"]
 
 
 def solr_num_found(fq):
-    params = {"q": "*:*", "fq": fq, "rows": "0", "wt": "json"}
-    qs = urllib.parse.urlencode(params, doseq=True)
-    req = urllib.request.Request(f"{SOLR_URL}?{qs}", headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data = json.load(resp)
+    data = _solr_get({"q": "*:*", "fq": fq, "rows": "0", "wt": "json"})
     return data["response"]["numFound"]
 
 
-def iter_sample_docs(fq, pct):
-    """Systematic sample: pct% of the archive, spread evenly (1 product every `stride`)."""
+def iter_sample_docs(fq, pct, stride=None, max_files=None):
+    """Systematic sample spread evenly across the archive.
+
+    By default samples pct% of the archive (1 product every total//target).
+    Pass `stride` to instead take exactly 1 product every `stride` results,
+    and `max_files` to cap how many products are yielded either way.
+    """
     total = solr_num_found(fq)
-    target = max(1, int(total * pct / 100))
-    stride = max(1, total // target)
-    print(f"    archive size: {total} products, sampling {pct}% => ~{target} products "
-          f"(1 every {stride})")
+    if stride:
+        target = max(1, total // stride)
+    else:
+        target = max(1, int(total * pct / 100))
+        stride = max(1, total // target)
+    if max_files:
+        target = min(target, max_files)
+    print(f"    archive size: {total} products => ~{target} products "
+          f"(1 every {stride}{f', capped at {max_files}' if max_files else ''})")
     offset = 0
     yielded = 0
     while offset < total and yielded < target:
-        docs = solr_query(fq, 1, start=offset)
+        try:
+            docs = solr_query(fq, 1, start=offset)
+        except Exception as e:
+            # Deep pagination (large start=) reliably 502s on the biggest
+            # archives -- skip this offset rather than aborting the whole run.
+            print(f"    catalog query at offset {offset} failed ({e}), skipping")
+            offset += stride
+            continue
         if docs:
             yield docs[0]
             yielded += 1
@@ -198,6 +285,128 @@ def download_file(url, dest_path, retries=3):
     return False
 
 
+def _read_pds3_image(path):
+    """Read the IMAGE object of a PDS3 .IMG file (e.g. HiRISE EDR) into a
+    float32 array, stripping per-line prefix/suffix bytes that GDAL's PDS
+    driver mishandles and masking 0xFF gap/missing pixels as NaN."""
+    import numpy as np
+    import re
+
+    with open(path, "rb") as f:
+        label = f.read(65536).decode("latin-1", errors="replace")
+
+    def _label_int(pattern, default=None):
+        mm = re.search(pattern, label)
+        if mm:
+            return int(mm.group(1))
+        if default is None:
+            raise ValueError(f"label field not found: {pattern}")
+        return default
+
+    offset = _label_int(r"\^IMAGE\s*=\s*(\d+)\s*<BYTES>") - 1
+    img_block = re.search(r"OBJECT\s*=\s*IMAGE\b(.*?)END_OBJECT\s*=\s*IMAGE\b",
+                          label, re.S)
+    if not img_block:
+        raise ValueError("no IMAGE object in label")
+    blk = img_block.group(1)
+
+    def _blk_int(field, default=None):
+        mm = re.search(rf"{field}\s*=\s*(\d+)", blk)
+        if mm:
+            return int(mm.group(1))
+        if default is None:
+            raise ValueError(f"IMAGE field not found: {field}")
+        return default
+
+    lines = _blk_int("LINES")
+    samples = _blk_int("LINE_SAMPLES")
+    bits = _blk_int("SAMPLE_BITS", 8)
+    prefix = _blk_int("LINE_PREFIX_BYTES", 0)
+    suffix = _blk_int("LINE_SUFFIX_BYTES", 0)
+
+    bpp = bits // 8
+    rec = prefix + samples * bpp + suffix
+    raw = np.fromfile(path, dtype=np.uint8, offset=offset, count=lines * rec)
+    lines = raw.size // rec  # tolerate truncated downloads
+    raw = raw[: lines * rec].reshape(lines, rec)[:, prefix:prefix + samples * bpp]
+    if bpp == 2:
+        dtype = ">u2" if "MSB" in blk else "<u2"
+        arr = raw.reshape(lines, samples, 2).copy().view(dtype)[:, :, 0].astype("float32")
+        arr[arr == 0xFFFF] = np.nan
+    else:
+        arr = raw.astype("float32")
+        arr[arr == 0xFF] = np.nan  # MISSING_CONSTANT / gap value
+    return arr
+
+
+def convert_and_resize(src_path, png_path, max_px):
+    """Decode a downloaded product and save it as an 8-bit PNG terrain patch
+    of at most `max_px` x `max_px`: the short side is scaled down to `max_px`
+    and the long side is center-cropped. (Orbital products are often extremely
+    elongated strips -- e.g. HiRISE EDRs at 1024 x ~25000 px -- so fitting the
+    whole strip into a square thumbnail would destroy all detail.)
+    Uses rasterio (GDAL) for PDS .IMG files, Pillow for everything else.
+    Returns True on success."""
+    import numpy as np
+    from PIL import Image
+
+    arr = None
+    if src_path.upper().endswith(".IMG"):
+        try:
+            arr = _read_pds3_image(src_path)
+        except Exception as e:
+            print(f"    PDS3 parse failed ({e}), falling back to rasterio")
+    if arr is None:
+        try:
+            import rasterio
+            with rasterio.open(src_path) as ds:
+                arr = ds.read(1).astype("float32")
+        except Exception:
+            try:
+                arr = np.asarray(Image.open(src_path).convert("L"), dtype="float32")
+            except Exception as e:
+                print(f"    convert failed ({os.path.basename(src_path)}): {e}")
+                return False
+
+    # Percentile stretch to 8-bit -- raw planetary data is 10-16 bit and would
+    # come out nearly black if divided by the full dtype range.
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        print(f"    convert failed ({os.path.basename(src_path)}): no valid pixels")
+        return False
+    # Estimate the stretch bounds ignoring saturated/nodata extremes (black
+    # fill borders and pure-white gaps would otherwise flatten the contrast).
+    interior = finite[(finite > 0) & (finite < finite.max())]
+    if interior.size > finite.size * 0.01:
+        finite = interior
+    lo, hi = np.percentile(finite, (0.5, 99.5))
+    if hi <= lo:
+        lo, hi = finite.min(), max(finite.max(), finite.min() + 1)
+    arr = np.nan_to_num(np.clip((arr - lo) / (hi - lo), 0, 1), nan=0.0)
+    img = Image.fromarray((arr * 255).astype("uint8"), mode="L")
+
+    if min(img.size) > max_px:
+        scale = max_px / min(img.size)
+        img = img.resize((max(1, round(img.width * scale)),
+                          max(1, round(img.height * scale))), Image.LANCZOS)
+    if max(img.size) > max_px:
+        left = (img.width - min(img.width, max_px)) // 2
+        top = (img.height - min(img.height, max_px)) // 2
+        img = img.crop((left, top,
+                        left + min(img.width, max_px),
+                        top + min(img.height, max_px)))
+
+    # Reject blank frames (saturated white-outs, black/night frames, gaps).
+    if _looks_blank(np.asarray(img, dtype="float32")):
+        print(f"    rejected as blank (white-out/black): {os.path.basename(src_path)}")
+        return None
+
+    os.makedirs(os.path.dirname(png_path), exist_ok=True)
+    img.save(png_path)
+    print(f"    resized -> {png_path} ({img.width}x{img.height})")
+    return True
+
+
 def download_pradan_tmc2(*_args, **_kwargs):
     """Chandrayaan-2 TMC2 browse data (ISSDC Pradan) -- NOT IMPLEMENTED.
 
@@ -219,18 +428,28 @@ def download_pradan_tmc2(*_args, **_kwargs):
 
 # --- main -------------------------------------------------------------------------
 
-def run_dataset(name, pct, outdir, delay, min_free_mb):
+def run_dataset(name, pct, outdir, delay, min_free_mb,
+                stride=None, max_files=None, resize=None, delete_raw=False,
+                prefilter=False):
     cfg = DATASETS[name]
     print(f"\n=== {cfg['label']} ===")
     manifest_path = os.path.join(outdir, "manifest.csv")
     write_header = not os.path.exists(manifest_path)
 
-    ok, failed, stopped_for_space = 0, 0, 0
+    # With a quality gate active (prefilter or resize-reject), --max-files
+    # counts KEPT images, so keep sampling the archive until the quota of
+    # good ones is met rather than counting skipped/rejected frames.
+    kept_quota = max_files if (prefilter or resize) else None
+    iter_cap = None if kept_quota else max_files
+
+    ok, failed, kept, skipped_blank, stopped_for_space = 0, 0, 0, 0, 0
     with open(manifest_path, "a", newline="", encoding="utf-8") as mf:
         writer = csv.writer(mf)
         if write_header:
             writer.writerow(["dataset", "product_id", "filename", "download_url", "local_path", "status"])
-        for doc in iter_sample_docs(cfg["fq"], pct):
+        for doc in iter_sample_docs(cfg["fq"], pct, stride=stride, max_files=iter_cap):
+            if kept_quota and kept >= kept_quota:
+                break
             free = free_mb(outdir)
             if free < min_free_mb:
                 print(f"    free space dropped to {free:.0f} MB (< {min_free_mb} MB), stopping.")
@@ -246,10 +465,46 @@ def run_dataset(name, pct, outdir, delay, min_free_mb):
                 continue
             fname = os.path.basename(doc[fname_field])
             dest = os.path.join(outdir, name, fname)
+            png = os.path.join(outdir, name + "_png",
+                               os.path.splitext(fname)[0] + ".png")
+            if resize and os.path.exists(png):
+                kept += 1
+                continue
+            if prefilter and not os.path.exists(dest):
+                if thumbnail_is_blank(doc):
+                    print(f"  [{name}] {fname}: thumbnail looks blank, skipping download")
+                    skipped_blank += 1
+                    writer.writerow([name, doc.get("PRODUCT_ID", ""), fname, url,
+                                      "", "SKIPPED_BLANK_THUMB"])
+                    mf.flush()
+                    continue
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             print(f"  [{name}] {fname} (free space: {free:.0f} MB)")
             success = download_file(url, dest)
             status = "OK" if success else "FAILED"
+            if success:
+                # Save the full PDS Atlas catalog record (coordinates, times,
+                # mission info, ...) alongside the image -- it's already in hand
+                # from the search query, so this costs no extra requests.
+                meta_path = os.path.join(outdir, name + "_meta",
+                                         os.path.splitext(fname)[0] + ".json")
+                os.makedirs(os.path.dirname(meta_path), exist_ok=True)
+                with open(meta_path, "w", encoding="utf-8") as jf:
+                    json.dump(doc, jf, indent=2, sort_keys=True)
+            if success and resize:
+                result = convert_and_resize(dest, png, resize)
+                if result:
+                    status = "OK+PNG"
+                    kept += 1
+                    if delete_raw:
+                        os.remove(dest)
+                        dest = png
+                elif result is None:
+                    # blank frame: nothing worth keeping, drop the raw too
+                    status = "REJECTED_BLANK"
+                    if delete_raw:
+                        os.remove(dest)
+                        dest = ""
             ok += success
             failed += not success
             writer.writerow([name, doc.get("PRODUCT_ID", ""), fname, url,
@@ -257,7 +512,8 @@ def run_dataset(name, pct, outdir, delay, min_free_mb):
             mf.flush()
             time.sleep(delay)
 
-    print(f"  {name}: {ok} downloaded, {failed} failed"
+    print(f"  {name}: {ok} downloaded, {kept} kept, {skipped_blank} pre-filtered as blank, "
+          f"{failed} failed"
           f"{', stopped for low disk space' if stopped_for_space else ''}.")
 
 
@@ -271,6 +527,19 @@ def main():
     ap.add_argument("--delay", type=float, default=1.0, help="pause in seconds between downloads")
     ap.add_argument("--min-free-mb", type=float, default=300,
                      help="abort downloads if free disk space drops below this threshold (MB)")
+    ap.add_argument("--stride", type=int, default=None,
+                     help="take exactly 1 product every N archive results (overrides --pct); "
+                          "combine with --max-files, archives hold millions of products")
+    ap.add_argument("--max-files", type=int, default=None,
+                     help="hard cap on downloads per dataset")
+    ap.add_argument("--resize", type=int, default=None, metavar="PX",
+                     help="also save each image as an 8-bit PNG with longest side PX "
+                          "(into <outdir>/<dataset>_png/); needs rasterio+pillow")
+    ap.add_argument("--delete-raw", action="store_true",
+                     help="with --resize: delete the raw product after a successful conversion")
+    ap.add_argument("--prefilter", action="store_true",
+                     help="fetch the catalog thumbnail first and skip blank "
+                          "(white/black) frames before downloading the full product")
     args = ap.parse_args()
 
     outdir = os.path.abspath(args.outdir)
@@ -278,7 +547,10 @@ def main():
 
     names = list(DATASETS) if args.dataset == "all" else [args.dataset]
     for name in names:
-        run_dataset(name, args.pct, outdir, args.delay, args.min_free_mb)
+        run_dataset(name, args.pct, outdir, args.delay, args.min_free_mb,
+                    stride=args.stride, max_files=args.max_files,
+                    resize=args.resize, delete_raw=args.delete_raw,
+                    prefilter=args.prefilter)
 
 
 if __name__ == "__main__":
