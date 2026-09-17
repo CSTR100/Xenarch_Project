@@ -353,9 +353,11 @@ class NumpyAnomalyScorer:
         return stats
 
     @staticmethod
-    def apply_norm(score_list: List[Dict], stats: Dict[str, tuple]) -> List[Dict]:
+    def apply_norm(score_list: List[Dict], stats: Dict[str, tuple],
+                   weights: Optional[Dict[str, float]] = None) -> List[Dict]:
         """Robust z + sigmoid normalization with externally supplied statistics;
         a single extreme chip can't compress the rest the way min-max did."""
+        w = {**COMBINED_WEIGHTS, **(weights or {})}
         result = []
         for s in score_list:
             s_out = dict(s)
@@ -364,7 +366,7 @@ class NumpyAnomalyScorer:
                 med, mad = stats[k]
                 n = float(1.0 / (1.0 + np.exp(-((s[k] - med) / mad) / 2.0)))
                 s_out[f"{k}_norm"] = n
-                combined += COMBINED_WEIGHTS[k] * n
+                combined += w[k] * n
             s_out["combined"] = float(combined)
             result.append(s_out)
         return result
@@ -825,11 +827,12 @@ def analyze_images(image_paths: List[str],
     log("Robust-normalising scores (median/MAD, "
         + ("stats from training baseline)…" if use_baseline else "self-referenced)…"))
     stats = NumpyAnomalyScorer.fit_norm_stats(ref_raw if use_baseline else raw_scores)
-    scored = NumpyAnomalyScorer.apply_norm(raw_scores, stats)
+    weights = cfg.get("combined_weights")
+    scored = NumpyAnomalyScorer.apply_norm(raw_scores, stats, weights=weights)
     ref_combined = None
     if use_baseline:
         ref_combined = [r["combined"] for r in
-                        NumpyAnomalyScorer.apply_norm(ref_raw, stats)]
+                        NumpyAnomalyScorer.apply_norm(ref_raw, stats, weights=weights)]
     progress(3, 70)
 
     # ── 4. rank ─────────────────────────────────────────────────────────────
